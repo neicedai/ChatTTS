@@ -12,7 +12,7 @@ ctv_cloud_env.py  (with iFLYTEK Private WS TTS integrated)
 - 快速管线：分段 ffmpeg 编码 + 无重编码 concat； MoviePy 2.x 兼容
 """
 
-import argparse, os, re, sys, tempfile, subprocess, base64, time, json, asyncio, ssl, hashlib, hmac, urllib.parse
+import argparse, os, re, sys, tempfile, subprocess, base64, time, json, asyncio, ssl, hashlib, hmac, urllib.parse, zipfile
 from io import BytesIO
 from urllib.parse import urlparse
 from pathlib import Path
@@ -25,6 +25,26 @@ from pydub import AudioSegment
 from moviepy import ImageClip, AudioFileClip, CompositeVideoClip, concatenate_videoclips, vfx
 import requests
 from dotenv import load_dotenv
+
+
+def _bool_from(value: Optional[Any], default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if not text:
+        return default
+    return text not in {"0", "false", "no", "off"}
+
+
+def _maybe_int(value: Optional[Any]) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 # ---------------- 基础工具 ----------------
 def natural_key(s: str):
@@ -392,6 +412,78 @@ def save_audio_http_tts_from_sentences(sentences: List[str], api_url: str,
         except Exception:
             raise RuntimeError("TTS service error")
 
+
+def save_audio_chatts_from_sentences(sentences: List[str], api_url: str,
+                                    prompt: Optional[str], speaker: Optional[str], seed: Optional[int],
+                                    lang: Optional[str], enable_refine: bool,
+                                    refine_prompt: Optional[str], refine_seed: Optional[int],
+                                    do_normalize: bool, do_homophone: bool,
+                                    timeout: float, out_path: Path, on_empty: str):
+    sents = [s.strip() for s in sentences if s.strip()]
+    if not sents:
+        if on_empty == "silence":
+            AudioSegment.silent(duration=600).export(out_path, format="mp3")
+            return
+        sents = ["这一页没有可读文本"]
+
+    payload: Dict[str, Any] = {
+        "text": sents,
+        "stream": False,
+        "skip_refine_text": not enable_refine,
+        "refine_text_only": False,
+        "use_decoder": True,
+        "do_text_normalization": bool(do_normalize),
+        "do_homophone_replacement": bool(do_homophone),
+    }
+    if lang:
+        payload["lang"] = lang
+
+    params_infer: Dict[str, Any] = {"prompt": prompt or "[speed_5]"}
+    if seed is not None:
+        params_infer["manual_seed"] = int(seed)
+    if speaker:
+        params_infer["spk_emb"] = speaker
+    payload["params_infer_code"] = params_infer
+
+    if enable_refine:
+        params_refine: Dict[str, Any] = {"prompt": refine_prompt or ""}
+        if refine_seed is not None:
+            params_refine["manual_seed"] = int(refine_seed)
+        payload["params_refine_text"] = params_refine
+    else:
+        payload["params_refine_text"] = None
+
+    resp = requests.post(api_url, json=payload, timeout=timeout)
+    resp.raise_for_status()
+
+    content_type = resp.headers.get("content-type", "").lower()
+    raw = resp.content
+    segments: List[AudioSegment] = []
+    silence = AudioSegment.silent(duration=300)
+
+    if raw.startswith(b"PK") or "zip" in content_type:
+        with zipfile.ZipFile(BytesIO(raw)) as zf:
+            names = [n for n in zf.namelist() if n.lower().endswith(('.mp3', '.wav', '.ogg', '.m4a'))]
+            if not names:
+                raise RuntimeError("ChatTTS API 未返回音频文件")
+            names.sort()
+            for idx, name in enumerate(names):
+                data = zf.read(name)
+                seg = AudioSegment.from_file(BytesIO(data))
+                segments.append(seg)
+                if idx != len(names) - 1:
+                    segments.append(silence)
+    else:
+        seg = AudioSegment.from_file(BytesIO(raw))
+        segments.append(seg)
+
+    if not segments:
+        raise RuntimeError("ChatTTS API 未返回有效音频数据")
+    final_seg = segments[0]
+    for seg in segments[1:]:
+        final_seg += seg
+    final_seg.export(out_path, format="mp3")
+
 # ---------------- TTS：iFLYTEK 私有域 WS ----------------
 def _rfc1123_date():
     import datetime
@@ -516,6 +608,11 @@ def worker_process_one(img_path_str: str,
                        eleven_voice_id: Optional[str],
                        # gtts/pyttsx3
                        voice_lang: str, voice_name: Optional[str],
+                       # chatts
+                       chatts_url: Optional[str], chatts_prompt: Optional[str], chatts_speaker: Optional[str],
+                       chatts_seed: Optional[int], chatts_lang: Optional[str],
+                       chatts_refine: bool, chatts_refine_prompt: Optional[str], chatts_refine_seed: Optional[int],
+                       chatts_normalize: bool, chatts_homophone: bool, chatts_timeout: float,
                        # iflytek
                        ifly_ws_url: Optional[str], ifly_app_id: Optional[str], ifly_key: Optional[str], ifly_secret: Optional[str],
                        ifly_vcn: str, ifly_speed: int, ifly_volume: int, ifly_pitch: int,
@@ -588,6 +685,26 @@ def worker_process_one(img_path_str: str,
                 save_audio_gtts_from_sentences(sentences, voice_lang, audio_path, on_empty)
             elif tts_engine == "pyttsx3":
                 save_audio_pyttsx3_from_sentences(sentences, voice_name, audio_path, on_empty)
+            elif tts_engine == "chatts":
+                api_url = (chatts_url or "http://127.0.0.1:9900/generate_voice").strip()
+                if not api_url:
+                    raise RuntimeError("缺少 ChatTTS API 地址（CHATTTS_API_URL 或 --chatts-url）")
+                save_audio_chatts_from_sentences(
+                    sentences,
+                    api_url,
+                    chatts_prompt or "[speed_5]",
+                    chatts_speaker,
+                    chatts_seed,
+                    chatts_lang,
+                    chatts_refine,
+                    chatts_refine_prompt,
+                    chatts_refine_seed,
+                    chatts_normalize,
+                    chatts_homophone,
+                    chatts_timeout,
+                    audio_path,
+                    on_empty,
+                )
             elif tts_engine == "http":
                 api_url = os.getenv("TTS_API_URL", "http://127.0.0.1:8002/tts")
                 tts_speed = float(os.getenv("TTS_SPEED", "1.0"))
@@ -704,7 +821,7 @@ def make_clip_with_audio(image_path: Path, audio_path: Path, subtitle_text: Opti
 # ---------------- 主流程 ----------------
 def default_workers(tts_engine: str) -> int:
     n = os.cpu_count() or 4
-    return 2 if tts_engine in ("edge","azure","gtts","elevenlabs","iflytek") else n
+    return 2 if tts_engine in ("edge","azure","gtts","elevenlabs","iflytek","chatts") else n
 
 def build_video(images: List[Path], out_path: Path,
                 ocr_engine: str, lang_ocr: str, ocr_psm: int, ocr_oem: int,
@@ -715,6 +832,10 @@ def build_video(images: List[Path], out_path: Path,
                 edge_voice: str, edge_rate: str, edge_pitch: str, edge_style: Optional[str],
                 azure_voice: str, azure_rate: str, azure_pitch: str, azure_style: Optional[str],
                 eleven_voice_id: Optional[str], voice_lang: str, voice_name: Optional[str],
+                chatts_url: Optional[str], chatts_prompt: Optional[str], chatts_speaker: Optional[str],
+                chatts_seed: Optional[int], chatts_lang: Optional[str],
+                chatts_refine: bool, chatts_refine_prompt: Optional[str], chatts_refine_seed: Optional[int],
+                chatts_normalize: bool, chatts_homophone: bool, chatts_timeout: float,
                 # iflytek
                 ifly_ws_url: Optional[str], ifly_app_id: Optional[str], ifly_key: Optional[str], ifly_secret: Optional[str],
                 ifly_vcn: str, ifly_speed: int, ifly_volume: int, ifly_pitch: int,
@@ -753,6 +874,10 @@ def build_video(images: List[Path], out_path: Path,
                 azure_voice, azure_rate, azure_pitch, azure_style,
                 eleven_voice_id,
                 voice_lang, voice_name,
+                chatts_url, chatts_prompt, chatts_speaker,
+                chatts_seed, chatts_lang,
+                chatts_refine, chatts_refine_prompt, chatts_refine_seed,
+                chatts_normalize, chatts_homophone, chatts_timeout,
                 ifly_ws_url, ifly_app_id, ifly_key, ifly_secret,
                 ifly_vcn, ifly_speed, ifly_volume, ifly_pitch,
                 ifly_encoding, ifly_sr, ifly_channels, ifly_bit_depth,
@@ -844,7 +969,7 @@ def main():
     ap.add_argument("--no-binarize", action="store_true")
 
     # TTS 总开关
-    ap.add_argument("--tts-engine", choices=["auto","edge","azure","elevenlabs","gtts","pyttsx3","iflytek","http"], default="auto")
+    ap.add_argument("--tts-engine", choices=["auto","edge","azure","elevenlabs","gtts","pyttsx3","iflytek","http","chatts"], default="auto")
 
     # edge（pitch/style 忽略以兼容老版 edge-tts）
     ap.add_argument("--edge-voice", default=None)
@@ -864,6 +989,19 @@ def main():
     # gtts/pyttsx3
     ap.add_argument("--voice-lang", default=None)
     ap.add_argument("--voice-name", default=None)
+
+    # chatts
+    ap.add_argument("--chatts-url", default=None)
+    ap.add_argument("--chatts-prompt", default=None)
+    ap.add_argument("--chatts-speaker", default=None)
+    ap.add_argument("--chatts-seed", type=int, default=None)
+    ap.add_argument("--chatts-lang", default=None)
+    ap.add_argument("--chatts-refine", action="store_true")
+    ap.add_argument("--chatts-refine-prompt", default=None)
+    ap.add_argument("--chatts-refine-seed", type=int, default=None)
+    ap.add_argument("--chatts-no-normalize", action="store_true")
+    ap.add_argument("--chatts-homophone", action="store_true")
+    ap.add_argument("--chatts-timeout", type=float, default=None)
 
     # iflytek（私有域）
     ap.add_argument("--ifly-ws-url", default=None, help="例：wss://cbm01.cn-huabei-1.xf-yun.com/v1/private/xxxx")
@@ -920,9 +1058,29 @@ def main():
     ocr_engine = pick_engine(args.ocr_engine, "OCR_VENDOR", "tencent",
                              ["tencent","baidu","rapidocr","tesseract","http"])
     tts_engine = pick_engine(args.tts_engine, "TTS_VENDOR", "edge",
-                             ["edge","azure","elevenlabs","gtts","pyttsx3","iflytek","http"])
+                             ["edge","azure","elevenlabs","gtts","pyttsx3","iflytek","http","chatts"])
     tencent_model = (args.tencent_model or os.getenv("TENCENT_OCR_MODEL","basic")).lower()
     if tencent_model not in ("basic","accurate"): tencent_model = "basic"
+
+    chatts_url = args.chatts_url or os.getenv("CHATTTS_API_URL")
+    chatts_url = chatts_url.strip() if chatts_url else "http://127.0.0.1:9900/generate_voice"
+    chatts_prompt = args.chatts_prompt or os.getenv("CHATTTS_PROMPT", "[speed_5]")
+    chatts_speaker = args.chatts_speaker or os.getenv("CHATTTS_SPK_EMB")
+    chatts_seed = args.chatts_seed if args.chatts_seed is not None else _maybe_int(os.getenv("CHATTTS_SEED"))
+    chatts_lang = args.chatts_lang or os.getenv("CHATTTS_LANG")
+    chatts_refine = args.chatts_refine or _bool_from(os.getenv("CHATTTS_REFINE"), False)
+    chatts_refine_prompt = args.chatts_refine_prompt or os.getenv("CHATTTS_REFINE_PROMPT")
+    chatts_refine_seed = args.chatts_refine_seed if args.chatts_refine_seed is not None else _maybe_int(os.getenv("CHATTTS_REFINE_SEED"))
+    chatts_normalize = _bool_from(os.getenv("CHATTTS_NORMALIZE"), not args.chatts_no_normalize)
+    chatts_homophone = _bool_from(os.getenv("CHATTTS_HOMOPHONE"), args.chatts_homophone)
+    if args.chatts_timeout is not None:
+        chatts_timeout = args.chatts_timeout
+    else:
+        timeout_env = os.getenv("CHATTTS_TIMEOUT")
+        try:
+            chatts_timeout = float(timeout_env) if timeout_env is not None else 120.0
+        except (TypeError, ValueError):
+            chatts_timeout = 120.0
 
     def ensure_env_vars(keys: List[str], context: str):
         missing = [k for k in keys if not os.getenv(k)]
@@ -945,6 +1103,9 @@ def main():
         ensure_env_vars(["AZURE_SPEECH_KEY", "AZURE_SPEECH_REGION"], "Azure 语音合成")
     elif tts_engine == "elevenlabs":
         ensure_env_vars(["ELEVEN_API_KEY"], "ElevenLabs 语音合成")
+    elif tts_engine == "chatts" and not chatts_url:
+        print("缺少 ChatTTS API URL（请通过 --chatts-url 或 CHATTTS_API_URL 指定）", file=sys.stderr)
+        sys.exit(1)
 
     # OCR 裁剪
     ocr_crop = None
@@ -1009,6 +1170,10 @@ def main():
         azure_voice=azure_voice, azure_rate=azure_rate, azure_pitch=azure_pitch, azure_style=azure_style,
         eleven_voice_id=eleven_voice_id,
         voice_lang=voice_lang, voice_name=voice_name,
+        chatts_url=chatts_url, chatts_prompt=chatts_prompt, chatts_speaker=chatts_speaker,
+        chatts_seed=chatts_seed, chatts_lang=chatts_lang,
+        chatts_refine=chatts_refine, chatts_refine_prompt=chatts_refine_prompt, chatts_refine_seed=chatts_refine_seed,
+        chatts_normalize=chatts_normalize, chatts_homophone=chatts_homophone, chatts_timeout=chatts_timeout,
         ifly_ws_url=ifly_ws_url, ifly_app_id=ifly_app_id, ifly_key=ifly_key, ifly_secret=ifly_secret,
         ifly_vcn=args.ifly_vcn, ifly_speed=args.ifly_speed, ifly_volume=args.ifly_volume, ifly_pitch=args.ifly_pitch,
         ifly_encoding=args.ifly_encoding, ifly_sr=args.ifly_sr, ifly_channels=args.ifly_channels, ifly_bit_depth=args.ifly_bit_depth,
