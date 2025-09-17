@@ -450,8 +450,6 @@ def save_audio_chatts_from_sentences(sentences: List[str], api_url: str,
         if refine_seed is not None:
             params_refine["manual_seed"] = int(refine_seed)
         payload["params_refine_text"] = params_refine
-    else:
-        payload["params_refine_text"] = None
 
     resp = requests.post(api_url, json=payload, timeout=timeout)
     resp.raise_for_status()
